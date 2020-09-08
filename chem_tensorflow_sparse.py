@@ -23,6 +23,13 @@ import sys, traceback
 import pdb
 import json
 
+import networkx as nx
+import matplotlib as mpl
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+from networkx.drawing.nx_agraph import graphviz_layout, to_agraph
+import matplotlib.image as mpimg
+
 from chem_tensorflow import ChemModel
 from utils import glorot_init, SMALL_NUMBER
 
@@ -41,16 +48,22 @@ class SparseGGNNChemModel(ChemModel):
     def default_params(cls):
         params = dict(super().default_params())
         params.update({
-            'batch_size': 100000,
+            'batch_size': 1000,
             'use_edge_bias': False,
             'use_propagation_attention': False,
             'use_edge_msg_avg_aggregation': True,
+
             'residual_connections': {  # For layer i, specify list of layers whose output is added as an input
                                      "2": [0],
                                      "4": [0, 2]
                                     },
 
             'layer_timesteps': [2, 2, 1, 2, 1],  # number of layers & propagation steps per layer
+
+            #TEST
+            # 'residual_connections': {},
+            # 'layer_timesteps': [4, 4, 4, 4, 4, 4, 4, 4],
+
 
             'graph_rnn_cell': 'GRU',  # GRU, CudnnCompatibleGRUCell, or RNN
             'graph_rnn_activation': 'tanh',  # tanh, ReLU
@@ -121,6 +134,7 @@ class SparseGGNNChemModel(ChemModel):
 
         message_targets = []  # list of tensors of message targets of shape [E]
         message_edge_types = []  # list of tensors of edge type of shape [E]
+
         for edge_type_idx, adjacency_list_for_edge_type in enumerate(self.placeholders['adjacency_lists']):
             edge_targets = adjacency_list_for_edge_type[:, 1]
             message_targets.append(edge_targets)
@@ -215,19 +229,59 @@ class SparseGGNNChemModel(ChemModel):
                         node_states_per_layer[-1] = self.gnn_weights.rnn_cells[layer_idx](incoming_information,
                                                                                           node_states_per_layer[-1])[1]  # Shape [V, D]
 
+        print("____________________________________________________________________________________________________________________________________________________________________________________")
+        for i in range(5):
+            print("__________", i)
+            #for j in range(20):
+            print(node_states_per_layer[-1])
+        print("____________________________________________________________________________________________________________________________________________________________________________________")
         return node_states_per_layer[-1]
 
     def gated_regression(self, last_h, regression_gate, regression_transform):
         # last_h: [v x h]
+
         gate_input = tf.concat([last_h, self.placeholders['initial_node_representation']], axis=-1)  # [v x 2h]
-        gated_outputs = tf.nn.sigmoid(regression_gate(gate_input)) * regression_transform(last_h)  # [v x 1]
+
+        self.relevance = tf.nn.sigmoid(regression_gate(gate_input))
+
+        # TRAINING (not necessarily):
+        # gated_outputs = self.relevance * regression_transform(last_h)  # [v x 1]
+
+        # VALID:
+        print_out = tf.Print(self.relevance, [self.relevance], "RELEVANCE DISTRIBUTION: ")
+        gated_outputs = print_out * regression_transform(last_h)  # [v x 1]
+
+        # TESTING:
+        # print("__ (h_v, x_v) - gate_input _________________________________________________")
+        # print(gate_input)
+        # print("__ (h_v, x_v) - gate_input _________________________________________________")
+        # print("__ last_h _________________________________________________")
+        # print(last_h)
+        # print("__ last_h _________________________________________________")
+        # print("__ relevance _________________________________________________")
+        # print(self.relevance)
+        # print(print_out)
+        # print("__ relevance _________________________________________________")
+        # print("___(?,1) - gated_outputs ________________________________________________")
+        # print(gated_outputs)
+        # print("___(?,1) - gated_outputs ________________________________________________")
 
         # Sum up all nodes per-graph
         graph_representations = tf.unsorted_segment_sum(data=gated_outputs,
                                                         segment_ids=self.placeholders['graph_nodes_list'],
                                                         num_segments=self.placeholders['num_graphs'])  # [g x 1]
+
         output = tf.squeeze(graph_representations)  # [g]
+        # BINARY CLASSIFICATION
+        # computed_values = [0 if value < 0.5 else 1 for value in computed_values]
+        # print(tf.shape(output))
+        # #output2 = tf.identity(output)
+        # output = tf.map_fn(fn=lambda x: tf.cond(tf.math.greater(tf.constant(0.5), x), lambda: tf.constant(0), lambda: tf.constant(1)), elems=output)
+        # print("############################################################")
+        # print(output)
+        # output = tf.nn.sigmoid(output)
         self.output = output
+
         return output
 
     # ----- Data preprocessing and chunking into minibatches:
@@ -239,6 +293,11 @@ class SparseGGNNChemModel(ChemModel):
                                      "num_incoming_edge_per_type": num_incoming_edge_per_type,
                                      "init": d["node_features"],
                                      "labels": [d["targets"][task_id][0] for task_id in self.params['task_ids']]})
+
+            # TESTING
+            # print('04###############################################################################################################################################')
+            # print(adjacency_lists)
+            # print('04###############################################################################################################################################')
 
         if is_training_data:
             np.random.shuffle(processed_graphs)
@@ -256,14 +315,24 @@ class SparseGGNNChemModel(ChemModel):
         num_incoming_edges_dicts_per_type = defaultdict(lambda: defaultdict(lambda: 0))
         for src, e, dest in graph:
             fwd_edge_type = e - 1  # Make edges start from 0
+
+            # TESTING
+            # print("actual: " + str(fwd_edge_type))
+            # print("%i, %i, %i" %(src, e, dest))
+            # print(graph)
+
             adj_lists[fwd_edge_type].append((src, dest))
             num_incoming_edges_dicts_per_type[fwd_edge_type][dest] += 1
-            if self.params['tie_fwd_bkwd']:
-                adj_lists[fwd_edge_type].append((dest, src))
-                num_incoming_edges_dicts_per_type[fwd_edge_type][src] += 1
+
+            # DO NOT USE FOR PROCESS MODELS
+            # if self.params['tie_fwd_bkwd']:
+            #     adj_lists[fwd_edge_type].append((dest, src))
+            #     num_incoming_edges_dicts_per_type[fwd_edge_type][src] += 1
 
         final_adj_lists = {e: np.array(sorted(lm), dtype=np.int32)
                            for e, lm in adj_lists.items()}
+
+        # print("final_adj_lists: ", final_adj_lists)
 
         # Add backward edges as an additional edge type that goes backwards:
         if not (self.params['tie_fwd_bkwd']):
@@ -309,7 +378,19 @@ class SparseGGNNChemModel(ChemModel):
                 # Turn counters for incoming edges into np array:
                 num_incoming_edges_per_type = np.zeros((num_nodes_in_graph, self.num_edge_types))
                 for (e_type, num_incoming_edges_per_type_dict) in cur_graph['num_incoming_edge_per_type'].items():
+                    #print("err: "+str(e_type))
                     for (node_id, edge_count) in num_incoming_edges_per_type_dict.items():
+
+                        # TESTING
+                        # print("err, node_id: " + str(node_id))
+                        # print("err, e_type: " + str(e_type))
+                        # print("err, num_inc_edg_p_type: " + str(num_incoming_edges_per_type))
+                        # print("err, edge_count: " + str(edge_count))
+                        # print("err num_nodes_in_graph: " + str(num_nodes_in_graph))
+                        # print("err self.num_edge_types: " + str(self.num_edge_types))
+                        # print(cur_graph['adjacency_lists'])
+                        # print(cur_graph['num_incoming_edge_per_type'])
+
                         num_incoming_edges_per_type[node_id, e_type] = edge_count
                 batch_num_incoming_edges_per_type.append(num_incoming_edges_per_type)
 
@@ -327,7 +408,7 @@ class SparseGGNNChemModel(ChemModel):
                 num_graphs += 1
                 num_graphs_in_batch += 1
                 node_offset += num_nodes_in_graph
-
+# LOOK HERE
             batch_feed_dict = {
                 self.placeholders['initial_node_representation']: np.array(batch_node_features),
                 self.placeholders['num_incoming_edges_per_type']: np.concatenate(batch_num_incoming_edges_per_type, axis=0),
@@ -350,8 +431,9 @@ class SparseGGNNChemModel(ChemModel):
             yield batch_feed_dict
 
     def evaluate_one_batch(self, data):
-        fetch_list = self.output
+        fetch_list = [self.output, self.relevance]
         batch_feed_dict = self.make_minibatch_iterator(data, is_training=False)
+        i = 0
         
         for item in batch_feed_dict:
             item[self.placeholders['graph_state_keep_prob']] = 1.0
@@ -359,20 +441,123 @@ class SparseGGNNChemModel(ChemModel):
             item[self.placeholders['out_layer_dropout_keep_prob']] = 1.0
             item[self.placeholders['target_values']] = [[]]
             item[self.placeholders['target_mask']] = [[]]
-            print(self.sess.run(fetch_list, feed_dict=item))
+
+            run_out = self.sess.run(fetch_list, feed_dict=item)
+
+            print("result (not discrete): ", run_out[0])
+            print("result: " + str(0 if run_out[0] < 0.5 else 1))
+            print("OUT RELEVANCE DISTR: ", run_out[1])
+
+            # TESTING:
+            # print('96################################################################################################################################################')
+            # print(self.ops['final_node_representations'])
+            # print('97################################################################################################################################################')
+            # print(self.graph.get_all_collection_keys())
+            # print(self.graph.get_collection('variables'))
+            # print('98################################################################################################################################################')
+            # print(self.graph.get_tensor_by_name("%s" % 'graph_mode/gnn_layer_0/gnn_edge_weights_0:0'))
+            # print('99################################################################################################################################################')
+
+            # G = nx.MultiDiGraph()
+            # for adj in self.placeholders['adjacency_lists']:
+            #     nodes = []
+            #     for edge in item[adj]:
+            #         if edge[0] not in nodes:
+            #             nodes.append(edge[0])
+            #         if edge[1] not in nodes:
+            #             nodes.append(edge[1])
+            #         G.add_edge(edge[0], edge[1])
+            # #colors = ['blue', 'green', 'yellow', 'orange', 'red']
+            # colors2 = cm.get_cmap('jet')
+            # max_G = max([run_out[1][i] for i in G])
+            # min_G = min([run_out[1][i] for i in G])
+            # delta = max_G - min_G
+            # norm = mpl.colors.Normalize(vmin=min_G-delta, vmax=max_G+delta)
+            # for node in G:
+            #     #G.node[node]['fillcolor'] = colors[int(run_out[1][node] * len(colors))]
+            #     color3 = colors2(norm(run_out[1][node]))[0,:3]
+            #     print(norm(run_out[1][node]))
+            #     G.node[node]['fillcolor'] = "{} {} {}".format(color3[0], color3[1], color3[2])
+            #     G.node[node]['style'] = 'filled'
+            #     #for i in range(5):
+            #     #    if item[self.placeholders['initial_node_representation']][node][i] == 1:
+            #     #        G.node[node]['fillcolor'] = colors[run_out[node]*len(colors)]
+            #     #        G.node[node]['style'] = 'filled'
+            #
+            # # pos = graphviz_layout(G, prog='dot')
+            # # nx.draw_networkx_nodes(G, pos, cmap=plt.get_cmap('plasma'), vmin=0, vmax=1)
+            # print("G-done")
+            # #nx.draw(G, cmap=cm.get_cmap('plasma'))
+            # A = to_agraph(G)
+            # A.layout('dot')
+            # A.draw('abcd.png')
+            #
+            # # add postmortum Klassifikation
+            #
+            # plt.imshow(mpimg.imread('abcd.png'))
+            # plt.show()
+
+            self.draw_graph(item,run_out, i)
+
+            writer = tf.summary.FileWriter("./logs/test1", self.sess.graph)
+            i = i+1
+
+    def draw_graph(self, item, run_out, idx):
+
+        G = nx.MultiDiGraph()
+        for adj in self.placeholders['adjacency_lists']:
+            nodes = []
+            for edge in item[adj]:
+                if edge[0] not in nodes:
+                    nodes.append(edge[0])
+                if edge[1] not in nodes:
+                    nodes.append(edge[1])
+                G.add_edge(edge[0], edge[1])
+        # colors = ['blue', 'green', 'yellow', 'orange', 'red']
+        colors2 = cm.get_cmap('jet')
+        max_G = max([run_out[1][i] for i in G])
+        min_G = min([run_out[1][i] for i in G])
+        # DELTA ERWÄHNEN
+        delta = max_G - min_G
+        norm = mpl.colors.Normalize(vmin=min_G - delta, vmax=max_G + delta)
+        for node in G:
+            # G.node[node]['fillcolor'] = colors[int(run_out[1][node] * len(colors))]
+            color3 = colors2(norm(run_out[1][node]))[0, :3]
+            print("NODE", str(node))
+            print("RELEVANCE", run_out[1][node])
+            print(norm(run_out[1][node]))
+            G.node[node]['fillcolor'] = "{} {} {}".format(color3[2], color3[1], color3[0])
+            G.node[node]['style'] = 'filled'
+            G.node[node]['fontcolor'] = 'white'
+
+        print("G-done")
+        A = to_agraph(G)
+        A.layout('circo')
+        filename = "abcd_{}.png".format(str(idx))
+        A.draw(filename)
+
+        plt.imshow(mpimg.imread(filename))
+        plt.show()
+        plt.clf()
+        plt.cla()
+        plt.close()
+
+
+
 
     def example_evaluation(self):
         ''' Demonstration of what test-time code would look like
         we query the model with the first n_example_molecules from the validation file
         '''
-        n_example_molecules = 10
-        with open('molecules_valid.json', 'r') as valid_file:
+        n_example_molecules = 1
+        with open('process_ex5_valid.json', 'r') as valid_file:
             example_molecules = json.load(valid_file)[:n_example_molecules]
 
         for mol in example_molecules:
             print(mol['targets'])
 
         example_molecules = self.process_raw_graphs(example_molecules, is_training_data=False)
+        #print(example_molecules)
         self.evaluate_one_batch(example_molecules)
 
 def main():

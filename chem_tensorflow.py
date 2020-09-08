@@ -17,23 +17,24 @@ class ChemModel(object):
     @classmethod
     def default_params(cls):
         return {
-            'num_epochs': 3000,
-            'patience': 25,
+            'num_epochs': 1000, #was 3000
+            'patience': 250,
             'learning_rate': 0.001,
             'clamp_gradient_norm': 1.0,
             'out_layer_dropout_keep_prob': 1.0,
 
-            'hidden_size': 100,
+            'hidden_size': 200,
             'num_timesteps': 4,
             'use_graph': True,
 
+            #adds backward edges - do not want this: process goes only one way
             'tie_fwd_bkwd': True,
             'task_ids': [0],
 
             'random_seed': 0,
 
-            'train_file': 'molecules_train.json',
-            'valid_file': 'molecules_valid.json'
+            'train_file': 'process_ex5_train.json',
+            'valid_file': 'process_ex5_valid.json'
         }
 
     def __init__(self, args):
@@ -131,7 +132,7 @@ class ChemModel(object):
         self.placeholders['num_graphs'] = tf.placeholder(tf.int32, [], name='num_graphs')
         self.placeholders['out_layer_dropout_keep_prob'] = tf.placeholder(tf.float32, [], name='out_layer_dropout_keep_prob')
 
-        with tf.variable_scope("graph_model"):
+        with tf.variable_scope("graph_mode"):
             self.prepare_specific_graph_model()
             # This does the actual graph work:
             if self.params['use_graph']:
@@ -151,16 +152,59 @@ class ChemModel(object):
                 computed_values = self.gated_regression(self.ops['final_node_representations'],
                                                         self.weights['regression_gate_task%i' % task_id],
                                                         self.weights['regression_transform_task%i' % task_id])
-                diff = computed_values - self.placeholders['target_values'][internal_id,:]
+                print(computed_values)
+
+
+# LOOK HERE
+                # computed values -> Tensor mit Werte zwischen 0 und 1 <- hier habe ich ein sigmoid drauf angewendet,
+                # eientlich sind sie nicht zwischen 0 und 1... -> sollte lieber kein sigmoid drüber gelegt werden? Aber
+                # gleichzeitig nähern sich die Werte sowieso bald diesem Bereich an.
+                # target values -> 0 oder 1: dass sind die Klassifikations-labels
+
+                # Nach meinem Verständnis sollte die „Accuracy“ über die nachfolgende Formel berechnet werden:
+                # Acc = 1 – 1/n*Summe(Label – Prediction)^2
+                #
+                # Abgebildet auf den vorliegenden Code (in etwa):
+                # accuracy_task = 1 – 1/task_target_num * tf.reduce_sum(tf.square(diff))
+
+                print_in = computed_values - self.placeholders['target_values'][internal_id,:]
+                diff = tf.Print(print_in, [print_in], "DIFF: ")
+
+                # uninteressant: nur None vergleich
                 task_target_mask = self.placeholders['target_mask'][internal_id,:]
                 task_target_num = tf.reduce_sum(task_target_mask) + SMALL_NUMBER
                 diff = diff * task_target_mask  # Mask out unused values
-                self.ops['accuracy_task%i' % task_id] = tf.reduce_sum(tf.abs(diff)) / task_target_num
-                task_loss = tf.reduce_sum(0.5 * tf.square(diff)) / task_target_num
+
+# if val_acc < best_val_acc -> val_acc ist die kumulation der accuracy values, so ziemlich,
+                # wie sie in 'accuracy_task' landen und dann wird gesagt, dass das modell besser geworden ist.
+                # Da bin ich mir irgendwie nicht sicher, dass das richtig ist...
+
+# IF abs is used with binary classification -> DMG
+                # Hier wundert mich das abs, weil wenn ich klassifikationen hab von z.B.:
+                    # 0.5, label 1 -> diff = -0.5
+                    # 0.5, label 0 -> diff = 0.5
+                    # und hier sorgt dann das abs dafür, dass die werde eben wieder genau gleich sind.
+                    # Und damit wird doch rein gar nichts erreicht dann...
+
+                # Eigentlich Mean Square ERROR
+                # actual:
+                # self.ops['accuracy_task%i' % task_id] = tf.reduce_sum(tf.abs(diff)) / task_target_num
+                # test:
+                self.ops['accuracy_task%i' % task_id] = tf.reduce_sum(tf.square(diff)) / task_target_num
+
+                # hier geht weider das Vorzeichen verloren, aber bei loss ist das egal, oder?
+                # task_loss = tf.reduce_sum(0.5 * tf.square(diff)) / task_target_num
+                task_loss = tf.reduce_sum(tf.square(diff)) / task_target_num
                 # Normalise loss to account for fewer task-specific examples in batch:
                 task_loss = task_loss * (1.0 / (self.params['task_sample_ratios'].get(task_id) or 1.0))
                 self.ops['losses'].append(task_loss)
         self.ops['loss'] = tf.reduce_sum(self.ops['losses'])
+
+        # TESTING
+        # print('01##########################################################################################################################################')
+        # print(self.ops['final_node_representations'])
+        # print(np.array(diff).shape)
+        # print('01#########################################################################################################################################')
 
     def make_train_step(self):
         trainable_vars = self.sess.graph.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
@@ -173,7 +217,7 @@ class ChemModel(object):
                 else:
                     print("Freezing weights of variable %s." % var.name)
             trainable_vars = filtered_vars
-        optimizer = tf.train.AdamOptimizer(self.params['learning_rate'])
+        optimizer = tf.train.AdadeltaOptimizer(1.0)
         grads_and_vars = optimizer.compute_gradients(self.ops['loss'], var_list=trainable_vars)
         clipped_grads = []
         for grad, var in grads_and_vars:
@@ -184,6 +228,12 @@ class ChemModel(object):
         self.ops['train_step'] = optimizer.apply_gradients(clipped_grads)
         # Initialize newly-introduced variables:
         self.sess.run(tf.local_variables_initializer())
+
+        # TESTING
+        # print('02##########################################################################################################################################')
+        # print(self.ops['final_node_representations'])
+        # print('02#########################################################################################################################################')
+
 
     def gated_regression(self, last_h, regression_gate, regression_transform):
         raise Exception("Models have to implement gated_regression!")
@@ -217,7 +267,13 @@ class ChemModel(object):
             else:
                 batch_data[self.placeholders['out_layer_dropout_keep_prob']] = 1.0
                 fetch_list = [self.ops['loss'], accuracy_ops]
-            result = self.sess.run(fetch_list, feed_dict=batch_data)
+              = self.sess.run(fetch_list, feed_dict=batch_data)
+
+            # TESTING
+            # print('03##########################################################################################################################################')
+            # print(self.ops['final_node_representations'])
+            # print('03##########################################################################################################################################')
+
             (batch_loss, batch_accuracies) = (result[0], result[1])
             loss += batch_loss * num_graphs
             accuracies.append(np.array(batch_accuracies) * num_graphs)
@@ -228,7 +284,11 @@ class ChemModel(object):
                                                                                loss / processed_graphs),
                   end='\r')
 
+        print("####################################################")
+        print(accuracies)
         accuracies = np.sum(accuracies, axis=0) / processed_graphs
+        print(accuracies)
+        print("####################################################")
         loss = loss / processed_graphs
         error_ratios = accuracies / chemical_accuracies[self.params["task_ids"]]
         instance_per_sec = processed_graphs / (time.time() - start_time)
@@ -295,7 +355,12 @@ class ChemModel(object):
                          "params": self.params,
                          "weights": weights_to_save
                        }
+        # print(len(weights_to_save['graph_model/gnn_layer_1/gnn_edge_weights_1:0']))
+        # for i in weights_to_save['graph_model/gnn_layer_1/gnn_edge_weights_1:0']:
+        #    print(i)
+        #    print("____________________________________________________________________________________________________________________________________________")
 
+        # print(data_to_save)
         with open(path, 'wb') as out_file:
             pickle.dump(data_to_save, out_file, pickle.HIGHEST_PROTOCOL)
 

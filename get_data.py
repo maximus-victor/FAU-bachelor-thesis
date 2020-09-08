@@ -12,13 +12,14 @@ download_path = os.path.join('data', 'dsgdb9nsd.xyz.tar.bz2')
 if not os.path.exists(download_path):
     print('downloading data to %s ...' % download_path)
     source = 'https://ndownloader.figshare.com/files/3195389'
-    os.system('wget -O %s %s' % (download_path, source))
+    os.system('curl -L -o %s %s' % (download_path, source))
     print('finished downloading')
 
 unzip_path = os.path.join('data', 'qm9_raw')
 if not os.path.exists(unzip_path):
     print('extracting data to %s ...' % unzip_path)
     os.mkdir(unzip_path)
+    print()
     os.system('tar xvjf %s -C %s' % (download_path, unzip_path))
     print('finished extracting')
 
@@ -41,6 +42,8 @@ def preprocess():
     print('reading data...')
     raw_data = {'train': [], 'valid': []}
     all_files = glob.glob(os.path.join(unzip_path, '*.xyz'))
+
+    #train valid spilit in {smiles, mu} format
     for file_idx, file_path in enumerate(all_files):
         if file_idx % 100 == 0:
             print('%.1f %%    \r' % (file_idx / float(len(all_files)) * 100), end=""),
@@ -61,6 +64,8 @@ def preprocess():
         return z
 
     bond_dict = {'SINGLE': 1, 'DOUBLE': 2, 'TRIPLE': 3, "AROMATIC": 4}
+
+    #nodes = node features in onehot(), edges = graph
     def to_graph(smiles):
         mol = Chem.MolFromSmiles(smiles)
         mol = Chem.AddHs(mol)
@@ -89,6 +94,8 @@ def preprocess():
             json.dump(processed_data[section], f)
 
 preprocess()
+
+
 
 
 
